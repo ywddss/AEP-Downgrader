@@ -81,7 +81,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QSettings, QUrl, QRect
 from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QTextCursor, QDesktopServices, QPainter
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 
 class ModernDarkTheme:
