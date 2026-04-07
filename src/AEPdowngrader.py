@@ -25,6 +25,7 @@ import shutil
 import struct
 import platform
 import traceback
+import subprocess
 import urllib.parse
 from pathlib import Path
 
@@ -68,12 +69,12 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QFileDialog, QTextEdit,
     QProgressBar, QGroupBox, QFormLayout, QMessageBox, QFrame,
-    QLineEdit, QCheckBox, QSizePolicy, QAction, QMenuBar, QMenu,
+    QCheckBox, QSizePolicy, QAction, QMenuBar, QMenu,
     QDialog, QDialogButtonBox, QScrollArea, QListWidget, QListWidgetItem,
     QStatusBar, QToolBar, QWidgetAction
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
-from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QTextCursor
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QSettings, QUrl
+from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QTextCursor, QDesktopServices
 
 
 class ModernDarkTheme:
@@ -556,16 +557,141 @@ class DowngradeWorker(QThread):
         return None
 
 
+class InputDropZone(QFrame):
+    """Clickable drag-and-drop area for selecting .aep input files."""
+    files_dropped = pyqtSignal(list)
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_active = False
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(90)
+        self.setCursor(Qt.PointingHandCursor)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
+
+        self.title_label = QLabel("Drop .aep files here or click to browse")
+        self.title_label.setAlignment(Qt.AlignCenter)
+        title_font = QFont()
+        title_font.setPointSize(10)
+        title_font.setBold(True)
+        self.title_label.setFont(title_font)
+
+        self.details_label = QLabel("No files selected")
+        self.details_label.setAlignment(Qt.AlignCenter)
+        self.details_label.setWordWrap(True)
+
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.details_label)
+        self._update_style()
+
+    def set_selected_files(self, file_paths):
+        """Update zone text based on selected files."""
+        if not file_paths:
+            self.details_label.setText("No files selected")
+            self._update_style()
+            return
+
+        if len(file_paths) == 1:
+            self.details_label.setText(Path(file_paths[0]).name)
+        else:
+            preview = ", ".join(Path(fp).name for fp in file_paths[:3])
+            suffix = "..." if len(file_paths) > 3 else ""
+            self.details_label.setText(f"{len(file_paths)} files: {preview}{suffix}")
+        self._update_style()
+
+    def dragEnterEvent(self, event):
+        if self._extract_valid_aep_paths(event.mimeData()):
+            self._drag_active = True
+            self._update_style()
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._drag_active = False
+        self._update_style()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        paths = self._extract_valid_aep_paths(event.mimeData())
+        self._drag_active = False
+        self._update_style()
+
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+    def setEnabled(self, enabled):
+        super().setEnabled(enabled)
+        self._update_style()
+
+    def _extract_valid_aep_paths(self, mime_data):
+        paths = []
+        if not mime_data or not mime_data.hasUrls():
+            return paths
+
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            local_path = url.toLocalFile()
+            if os.path.isfile(local_path) and local_path.lower().endswith(".aep"):
+                paths.append(local_path)
+        return paths
+
+    def _update_style(self):
+        if not self.isEnabled():
+            border_color = "#444444"
+            background = "#232323"
+        elif self._drag_active:
+            border_color = ModernDarkTheme.HIGHLIGHT
+            background = "#1b3550"
+        else:
+            border_color = ModernDarkTheme.BORDER
+            background = ModernDarkTheme.PANEL
+
+        self.setStyleSheet(f"""
+            QFrame {{
+                background-color: {background};
+                border: 1px dashed {border_color};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                color: {ModernDarkTheme.TEXT};
+                border: none;
+                background: transparent;
+            }}
+        """)
+
+
 class AEPDowngraderGUI(QMainWindow):
     """Main GUI window for AEP Downgrader"""
     
     def __init__(self):
         super().__init__()
+        
+        # Initialize settings for remembering last used directories
+        self.settings = QSettings("AEPDowngrader", "AEPDowngrader")
+        self.selected_input_files = []
+        self.current_output_directory = ""
+        self.last_converted_files = []
+        
         self.debug_enabled = False
         self.debug_log_path = None
         self.init_ui()
         self.setup_connections()
         self.setup_menu()
+        self.apply_fixed_window_size()
         self.worker = None
         
         # Log application start in debug mode if it was enabled before
@@ -577,6 +703,10 @@ class AEPDowngraderGUI(QMainWindow):
 
     def get_resource_path(self, relative_path):
         """Get absolute path to resource, works for dev and for PyInstaller"""
+        import platform
+        import logging
+        logger = logging.getLogger(__name__)
+        
         try:
             # PyInstaller creates a temp folder and stores path in _MEIPASS
             base_path = sys._MEIPASS
@@ -586,26 +716,65 @@ class AEPDowngraderGUI(QMainWindow):
         # For PyInstaller bundled app, resources are in the executable's directory
         bundled_path = os.path.join(base_path, relative_path)
         if os.path.exists(bundled_path):
+            logger.debug(f"[ICON-DEBUG] Found resource at bundled path: {bundled_path}")
             return bundled_path
 
         # For development, look in the project structure
         dev_path = os.path.join(os.path.dirname(__file__), '..', relative_path)
         if os.path.exists(dev_path):
+            logger.debug(f"[ICON-DEBUG] Found resource at dev path: {dev_path}")
             return dev_path
 
+        # Log diagnostic info for Linux/Wayland
+        logger.warning(f"[ICON-DEBUG] Resource not found: {relative_path}")
+        logger.warning(f"[ICON-DEBUG] Base path: {base_path}")
+        logger.warning(f"[ICON-DEBUG] Platform: {platform.system()}")
+        logger.warning(f"[ICON-DEBUG] Wayland display: {os.environ.get('WAYLAND_DISPLAY', 'Not set')}")
+        
         # Return the original path if nothing else works
         return relative_path
+    
+    def get_last_directory(self, key="last_directory"):
+        """Get last used directory from settings"""
+        last_dir = self.settings.value(key, "")
+        if last_dir and os.path.exists(last_dir):
+            return last_dir
+        return os.path.expanduser("~")
+    
+    def set_last_directory(self, path, key="last_directory"):
+        """Save last used directory to settings"""
+        if path:
+            dir_path = os.path.dirname(path) if os.path.isfile(path) else path
+            self.settings.setValue(key, dir_path)
 
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("AEP Downgrader")
         self.setGeometry(100, 100, 900, 700)
-        self.setMinimumSize(800, 600)
 
         # Set window icon
         icon_path = self.get_resource_path('assets/icon.png')
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
+            print(f"[ICON-DEBUG] Window icon set from: {icon_path}")
+        else:
+            print(f"[ICON-DEBUG] Window icon NOT found at: {icon_path}")
+            print(f"[ICON-DEBUG] Current working directory: {os.getcwd()}")
+            print(f"[ICON-DEBUG] __file__ = {__file__}")
+            
+            # Try to list assets directory
+            assets_path = self.get_resource_path('assets')
+            if os.path.exists(assets_path):
+                print(f"[ICON-DEBUG] Assets directory exists: {assets_path}")
+                print(f"[ICON-DEBUG] Contents: {os.listdir(assets_path)}")
+        
+        # Wayland-specific: set desktop file name for proper icon mapping
+        if os.environ.get('WAYLAND_DISPLAY'):
+            from PyQt5.QtGui import QGuiApplication
+            # This helps Wayland find the correct icon from .desktop file
+            # The name must match the .desktop file name WITHOUT extension
+            QGuiApplication.setDesktopFileName("AEPdowngrader")
+            print("[ICON-DEBUG] Wayland detected, set desktop file name to: AEPdowngrader")
 
         # Apply dark theme
         self.apply_dark_theme()
@@ -644,49 +813,25 @@ class AEPDowngraderGUI(QMainWindow):
         input_label.setStyleSheet(f"color: {ModernDarkTheme.TEXT}; font-weight: bold;")
         io_layout.addWidget(input_label)
 
-        input_layout = QHBoxLayout()
-        input_layout.setSpacing(5)  # Reduce spacing between line edit and button
-        self.input_line_edit = QLineEdit()
-        self.input_line_edit.setPlaceholderText("Select input .aep file(s)... (multiple files supported)")
-        self.input_line_edit.setStyleSheet(self.get_line_edit_style())
-        self.input_line_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.input_line_edit.setMinimumHeight(37)
-        self.input_line_edit.setMaximumHeight(37)
-        self.input_browse_btn = QPushButton("Browse")
-        self.input_browse_btn.setStyleSheet(self.get_compact_button_style())
-        self.input_browse_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.input_browse_btn.setFixedWidth(90)
-        self.input_browse_btn.setFixedHeight(37)
-        self.input_browse_btn.setMaximumHeight(37)
-        self.input_browse_btn.setMinimumHeight(37)
-        input_layout.addWidget(self.input_line_edit)
-        input_layout.addWidget(self.input_browse_btn)
-        input_layout.setAlignment(Qt.AlignVCenter)  # Align items vertically centered
-        io_layout.addLayout(input_layout)
+        self.input_drop_zone = InputDropZone()
+        io_layout.addWidget(self.input_drop_zone)
 
         # Output file selection
-        output_label = QLabel("Output Directory:")
+        output_label = QLabel("Output:")
         output_label.setStyleSheet(f"color: {ModernDarkTheme.TEXT}; font-weight: bold;")
         io_layout.addWidget(output_label)
 
-        output_layout = QHBoxLayout()
-        output_layout.setSpacing(5)  # Reduce spacing between line edit and button
-        self.output_line_edit = QLineEdit()
-        self.output_line_edit.setPlaceholderText("Save near original file (default) or specify location...")
-        self.output_line_edit.setStyleSheet(self.get_line_edit_style())
-        self.output_line_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.output_line_edit.setMinimumHeight(37)
-        self.output_line_edit.setMaximumHeight(37)
-        self.output_browse_btn = QPushButton("Browse")
-        self.output_browse_btn.setStyleSheet(self.get_compact_button_style())
-        self.output_browse_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.output_browse_btn.setFixedWidth(90)
-        self.output_browse_btn.setFixedHeight(37)
-        self.output_browse_btn.setMaximumHeight(37)
-        self.output_browse_btn.setMinimumHeight(37)
-        output_layout.addWidget(self.output_line_edit)
-        output_layout.addWidget(self.output_browse_btn)
-        output_layout.setAlignment(Qt.AlignVCenter)  # Align items vertically centered
+        output_layout = QVBoxLayout()
+        output_layout.setSpacing(8)
+        self.output_status_label = QLabel("Converted files will be saved next to selected input files.")
+        self.output_status_label.setStyleSheet(f"color: {ModernDarkTheme.TEXT_SECONDARY};")
+        self.output_status_label.setWordWrap(True)
+        self.view_output_btn = QPushButton("View Converted Files")
+        self.view_output_btn.setStyleSheet(self.get_compact_button_style())
+        self.view_output_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.view_output_btn.setFixedHeight(37)
+        output_layout.addWidget(self.output_status_label)
+        output_layout.addWidget(self.view_output_btn)
         io_layout.addLayout(output_layout)
         
         # Conversion options
@@ -749,11 +894,27 @@ class AEPDowngraderGUI(QMainWindow):
         
         # Add stretch to push everything up
         main_layout.addStretch()
+
+    def apply_fixed_window_size(self):
+        """Lock the window to a fixed size that fits all UI elements."""
+        central_layout = self.centralWidget().layout() if self.centralWidget() else None
+        if central_layout:
+            central_layout.activate()
+        central_hint = self.centralWidget().sizeHint() if self.centralWidget() else QSize(900, 700)
+        menu_height = self.menuBar().sizeHint().height() if self.menuBar() else 0
+
+        # Extra margins account for frame decorations and platform font/style differences.
+        width = max(900, central_hint.width() + 40)
+        height = max(700, central_hint.height() + menu_height + 60)
+
+        self.resize(width, height)
+        self.setFixedSize(width, height)
     
     def setup_connections(self):
         """Setup signal connections"""
-        self.input_browse_btn.clicked.connect(self.browse_input_files)
-        self.output_browse_btn.clicked.connect(self.browse_output_file)
+        self.input_drop_zone.clicked.connect(self.browse_input_files)
+        self.input_drop_zone.files_dropped.connect(self.handle_input_files)
+        self.view_output_btn.clicked.connect(self.open_converted_files_location)
         self.convert_btn.clicked.connect(self.start_conversion)
         self.cancel_btn.clicked.connect(self.cancel_conversion)
     
@@ -1135,95 +1296,193 @@ class AEPDowngraderGUI(QMainWindow):
             }}
         """
     
-    def browse_input_file(self):
-        """Open file dialog to select input file (single file)"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Input AEP File", "", "AEP Files (*.aep);;All Files (*)"
-        )
-        if file_path:
-            self.input_line_edit.setText(file_path)
-
-            # Detect version of the loaded file
-            detected_version_str, detected_version_num = self.detect_ae_version(file_path)
-            detected_version_parts = detected_version_str.split()
-            detected_version_only = detected_version_parts[0] if detected_version_parts else "Unknown"
-            self.detected_version_label.setText(f"Detected versions: {detected_version_only}")
-
-            # Update checkbox states based on detected version
-            self.update_version_checkboxes(detected_version_num)
-
-            # Auto-populate output directory if not set
-            if not self.output_line_edit.text():
-                path = Path(file_path)
-                output_dir = path.parent
-                self.output_line_edit.setText(str(output_dir))
-                self.output_line_edit.setPlaceholderText(f"Save near original file ({output_dir})")
-
     def browse_input_files(self):
-        """Open file dialog to select multiple input files"""
+        """Open native file dialog to select input files."""
         if DEBUG_MODULE_AVAILABLE and self.debug_enabled:
             debug_logger.log_function_call("browse_input_files")
-        
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select Input AEP Files", "", "AEP Files (*.aep);;All Files (*)"
-        )
+
+        last_dir = self.get_last_directory("last_input_directory")
+        file_paths = []
+        linux_picker_handled = False
+
+        # On Linux, prefer desktop-native pickers for better integration (KDE/GNOME).
+        if platform.system() == "Linux":
+            handled, linux_paths = self._browse_input_files_linux_native(last_dir)
+            if handled:
+                linux_picker_handled = True
+                file_paths = linux_paths
+
+        if not linux_picker_handled:
+            file_paths, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Select Input AEP Files",
+                last_dir,
+                "AEP Files (*.aep);;All Files (*)"
+            )
         if file_paths:
-            if DEBUG_MODULE_AVAILABLE and self.debug_enabled:
-                debug_logger.info(f"Selected {len(file_paths)} files")
-                for fp in file_paths:
-                    debug_logger.debug(f"Input file: {fp}")
-            
-            # Display count of selected files
-            self.input_line_edit.setText(f"{len(file_paths)} files selected: {', '.join([Path(fp).name for fp in file_paths[:3]])}{'...' if len(file_paths) > 3 else ''}")
+            self.handle_input_files(file_paths)
 
-            # Store the actual file paths for processing
-            self.selected_input_files = file_paths
+    def _browse_input_files_linux_native(self, last_dir):
+        """Try Linux desktop-native pickers. Returns (handled, file_paths)."""
+        handled, file_paths = self._browse_input_files_with_kdialog(last_dir)
+        if handled:
+            return handled, file_paths
 
-            # Auto-detect versions from all files and update UI accordingly
-            if file_paths:
-                detected_versions = set()  # Use set to store unique versions
-                highest_version = 0
-                highest_version_file = file_paths[0]
+        handled, file_paths = self._browse_input_files_with_zenity(last_dir)
+        if handled:
+            return handled, file_paths
 
-                for file_path in file_paths:
-                    detected_version_str, detected_version_num = self.detect_ae_version(file_path)
-                    if detected_version_num > 0:  # Valid version detected
-                        # Extract the full version string (e.g., "AE 24.x") instead of just the first word
-                        version_parts = detected_version_str.split()
-                        if len(version_parts) >= 2:
-                            detected_versions.add(f"{version_parts[0]} {version_parts[1]}")  # "AE 24.x"
-                        elif len(version_parts) >= 1:
-                            detected_versions.add(version_parts[0])
-                        if detected_version_num > highest_version:
-                            highest_version = detected_version_num
-                            highest_version_file = file_path
+        return False, []
 
-                # Display detected versions
-                if detected_versions:
-                    # Extract version numbers and sort them in descending order
-                    def extract_version_number(version_str):
-                        # Extract the major version number from strings like "AE 24.x"
-                        try:
-                            # Split by space and take the second part ("24.x"), then split by dot and take first part ("24")
-                            return int(version_str.split()[1].split('.')[0])
-                        except (ValueError, IndexError):
-                            return 0
+    def _browse_input_files_with_kdialog(self, last_dir):
+        """Use KDE's native file picker via kdialog when available."""
+        if not shutil.which("kdialog"):
+            return False, []
 
-                    sorted_versions = sorted(detected_versions, reverse=True, key=extract_version_number)
-                    versions_list = ', '.join(sorted_versions)
-                    self.detected_version_label.setText(f"Detected versions: {versions_list}")
-                else:
-                    self.detected_version_label.setText("Detected versions: Unknown")
+        start_path = last_dir if os.path.isdir(last_dir) else os.path.expanduser("~")
+        cmd = [
+            "kdialog",
+            "--title", "Select Input AEP Files",
+            "--multiple",
+            "--separate-output",
+            "--getopenfilename",
+            start_path,
+            "*.aep *.AEP|AEP Files (*.aep)"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return True, []
 
-                # Update checkbox states based on the highest detected version
-                self.update_version_checkboxes(highest_version)
+        file_paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return True, file_paths
 
-                # Auto-populate output directory if not set
-                if not self.output_line_edit.text():
-                    first_path = Path(highest_version_file)
-                    output_dir = first_path.parent
-                    self.output_line_edit.setText(str(output_dir))
-                    self.output_line_edit.setPlaceholderText(f"Save near original files ({output_dir})")
+    def _browse_input_files_with_zenity(self, last_dir):
+        """Use GNOME/GTK native file picker via zenity when available."""
+        if not shutil.which("zenity"):
+            return False, []
+
+        start_path = last_dir if os.path.isdir(last_dir) else os.path.expanduser("~")
+        if not start_path.endswith(os.sep):
+            start_path += os.sep
+
+        cmd = [
+            "zenity",
+            "--file-selection",
+            "--multiple",
+            "--separator=\n",
+            "--title=Select Input AEP Files",
+            f"--filename={start_path}"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return True, []
+
+        file_paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return True, file_paths
+
+    def handle_input_files(self, file_paths):
+        """Store selected files, update version info, and refresh output location."""
+        normalized_paths = []
+        seen_paths = set()
+        for file_path in file_paths:
+            path_str = str(Path(file_path).resolve())
+            if path_str in seen_paths:
+                continue
+            if not os.path.isfile(path_str):
+                continue
+            if not path_str.lower().endswith(".aep"):
+                continue
+            normalized_paths.append(path_str)
+            seen_paths.add(path_str)
+
+        if not normalized_paths:
+            QMessageBox.warning(self, "Invalid Selection", "Please select one or more .aep files.")
+            return
+
+        if DEBUG_MODULE_AVAILABLE and self.debug_enabled:
+            debug_logger.info(f"Selected {len(normalized_paths)} files")
+            for fp in normalized_paths:
+                debug_logger.debug(f"Input file: {fp}")
+
+        self.selected_input_files = normalized_paths
+        self.last_converted_files = []
+        self.input_drop_zone.set_selected_files(normalized_paths)
+        self.set_last_directory(normalized_paths[0], "last_input_directory")
+
+        self._update_detected_versions(normalized_paths)
+        self._update_output_directory_from_inputs(normalized_paths)
+
+    def _update_detected_versions(self, file_paths):
+        """Detect versions across all selected input files and update UI controls."""
+        detected_versions = set()
+        highest_version = 0
+
+        for file_path in file_paths:
+            detected_version_str, detected_version_num = self.detect_ae_version(file_path)
+            if detected_version_num > 0:
+                version_parts = detected_version_str.split()
+                if len(version_parts) >= 2:
+                    detected_versions.add(f"{version_parts[0]} {version_parts[1]}")
+                elif len(version_parts) == 1:
+                    detected_versions.add(version_parts[0])
+                highest_version = max(highest_version, detected_version_num)
+
+        if detected_versions:
+            def extract_version_number(version_str):
+                try:
+                    return int(version_str.split()[1].split('.')[0])
+                except (ValueError, IndexError):
+                    return 0
+
+            sorted_versions = sorted(detected_versions, reverse=True, key=extract_version_number)
+            self.detected_version_label.setText(f"Detected versions: {', '.join(sorted_versions)}")
+        else:
+            self.detected_version_label.setText("Detected versions: Unknown")
+
+        self.update_version_checkboxes(highest_version)
+
+    def _update_output_directory_from_inputs(self, file_paths):
+        """Set and display output directory info based on selected input files."""
+        if not file_paths:
+            self.current_output_directory = ""
+            self.output_status_label.setText("Converted files will be saved next to selected input files.")
+            return
+
+        output_dirs = [str(Path(fp).parent) for fp in file_paths]
+        self.current_output_directory = output_dirs[0]
+        self.set_last_directory(self.current_output_directory, "last_output_directory")
+
+        unique_dirs = sorted(set(output_dirs))
+        if len(unique_dirs) == 1:
+            self.output_status_label.setText(f"Converted files will be saved to: {unique_dirs[0]}")
+        else:
+            self.output_status_label.setText(
+                "Converted files will be saved next to each original file.\n"
+                f"Primary folder for quick access: {self.current_output_directory}"
+            )
+
+    def open_converted_files_location(self):
+        """Open file manager at the latest converted files folder."""
+        target_dir = ""
+        if self.last_converted_files:
+            output_dirs = sorted({str(Path(fp).parent) for fp in self.last_converted_files})
+            target_dir = output_dirs[0]
+            if len(output_dirs) > 1:
+                self.update_log(
+                    f"Converted files are in multiple folders. Opening primary folder: {target_dir}"
+                )
+        elif self.current_output_directory:
+            target_dir = self.current_output_directory
+        else:
+            target_dir = self.get_last_directory("last_output_directory")
+
+        if not target_dir or not os.path.isdir(target_dir):
+            QMessageBox.information(self, "No Output Folder", "No converted files folder is available yet.")
+            return
+
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(target_dir))
+        if not opened:
+            QMessageBox.warning(self, "Open Folder Failed", f"Could not open folder:\n{target_dir}")
 
     def update_version_checkboxes(self, detected_version):
         """Update checkbox states based on detected version"""
@@ -1352,41 +1611,17 @@ class AEPDowngraderGUI(QMainWindow):
             
             return f"Error: {str(e)}", 0
     
-    def browse_output_file(self):
-        """Open file dialog to select output directory"""
-        directory = QFileDialog.getExistingDirectory(
-            self, "Select Output Directory", ""
-        )
-        if directory:
-            self.output_line_edit.setText(directory)
-    
     def start_conversion(self):
         """Start the conversion process"""
         if DEBUG_MODULE_AVAILABLE and self.debug_enabled:
             debug_logger.log_function_call("start_conversion")
             debug_logger.log_memory("Before conversion")
-        
-        input_path = self.input_line_edit.text().strip()
 
-        if not input_path:
-            QMessageBox.warning(self, "Warning", "Please select an input file")
+        if not self.selected_input_files:
+            QMessageBox.warning(self, "Warning", "Please select at least one input .aep file")
             return
 
-        # Determine if we're dealing with multiple files
-        if hasattr(self, 'selected_input_files') and self.selected_input_files:
-            input_files = self.selected_input_files
-        else:
-            # Single file mode
-            if not os.path.exists(input_path):
-                QMessageBox.critical(self, "Error", f"Input file does not exist: {input_path}")
-                return
-
-            # Check if input is an .aep file
-            if not input_path.lower().endswith('.aep'):
-                QMessageBox.critical(self, "Error", "Input file must be an .aep file")
-                return
-
-            input_files = [input_path]
+        input_files = list(self.selected_input_files)
 
         # Get selected target versions
         target_versions = []
@@ -1404,38 +1639,22 @@ class AEPDowngraderGUI(QMainWindow):
         # Disable UI during conversion
         self.convert_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
-        self.input_browse_btn.setEnabled(False)
-        self.output_browse_btn.setEnabled(False)
+        self.input_drop_zone.setEnabled(False)
+        self.view_output_btn.setEnabled(False)
 
         # Reset progress
         self.progress_bar.setValue(0)
         self.log_text_edit.clear()
+        self.last_converted_files = []
 
         # Create and start worker threads for each file and target version combination
         self.active_workers = []  # Track active workers
-
-        # Get output directory
-        output_text = self.output_line_edit.text().strip()
-        if output_text:
-            output_dir = Path(output_text)
-            if not output_dir.exists() or not output_dir.is_dir():
-                QMessageBox.critical(self, "Error", f"Output directory does not exist: {output_dir}")
-                self.reset_ui()
-                return
-        else:
-            # If no output directory specified, use the directory of the first input file
-            first_input_dir = Path(input_files[0]).parent
-            output_dir = first_input_dir
+        self._successful_output_files = []
 
         # Create workers for each file and each target version
         for input_file in input_files:
             input_path_obj = Path(input_file)
-
-            # Determine output directory for this specific file
-            if output_text:  # If user specified an output directory
-                current_output_dir = output_dir
-            else:  # Use the directory of the input file
-                current_output_dir = input_path_obj.parent
+            current_output_dir = input_path_obj.parent
 
             for target_version in target_versions:
                 # Generate output filename based on input name and target version
@@ -1446,7 +1665,11 @@ class AEPDowngraderGUI(QMainWindow):
                 # Create worker for this conversion
                 worker = DowngradeWorker(str(input_file), str(output_path), target_version, self.debug_enabled)
                 worker.progress_signal.connect(self.update_log)
-                worker.finished_signal.connect(self.single_conversion_finished)
+                worker.finished_signal.connect(
+                    lambda success, message, out_path=str(output_path): self.single_conversion_finished(
+                        success, message, out_path
+                    )
+                )
                 self.active_workers.append(worker)
 
         # Start all workers
@@ -1464,12 +1687,13 @@ class AEPDowngraderGUI(QMainWindow):
 
         self.update_log(f"Started {self.total_workers} conversion(s) for {len(input_files)} file(s)")
 
-    def single_conversion_finished(self, success, message):
+    def single_conversion_finished(self, success, message, output_path):
         """Handle completion of a single conversion"""
         self.completed_workers += 1
 
         if success:
             self.successful_conversions += 1
+            self._successful_output_files.append(output_path)
 
         if self.completed_workers >= self.total_workers:
             # All conversions finished
@@ -1491,6 +1715,11 @@ class AEPDowngraderGUI(QMainWindow):
                 "Error",
                 "All conversions failed!"
             )
+
+        self.last_converted_files = list(self._successful_output_files)
+        if self.last_converted_files:
+            self.current_output_directory = str(Path(self.last_converted_files[0]).parent)
+            self.set_last_directory(self.current_output_directory, "last_output_directory")
 
         self.reset_ui()
     
@@ -1534,8 +1763,8 @@ class AEPDowngraderGUI(QMainWindow):
         """Reset UI to initial state"""
         self.convert_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
-        self.input_browse_btn.setEnabled(True)
-        self.output_browse_btn.setEnabled(True)
+        self.input_drop_zone.setEnabled(True)
+        self.view_output_btn.setEnabled(True)
         # Clear worker references
         self.active_workers = None
         self.worker = None
