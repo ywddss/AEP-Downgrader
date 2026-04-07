@@ -26,7 +26,12 @@ import struct
 import platform
 import traceback
 import subprocess
+import json
+import re
+import time
 import urllib.parse
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 # Import debug logger module
@@ -75,6 +80,8 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QSettings, QUrl, QRect
 from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QTextCursor, QDesktopServices, QPainter
+
+APP_VERSION = "1.1.0"
 
 
 class ModernDarkTheme:
@@ -557,6 +564,47 @@ class DowngradeWorker(QThread):
         return None
 
 
+class UpdateCheckWorker(QThread):
+    """Background worker that fetches latest GitHub release info."""
+    finished_signal = pyqtSignal(dict)
+    error_signal = pyqtSignal(str)
+
+    def run(self):
+        url = "https://api.github.com/repos/itsAnchorpoint/AEP-Downgrader/releases/latest"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "AEP-Downgrader-UpdateCheck"
+            }
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                payload = response.read().decode("utf-8")
+            data = json.loads(payload)
+        except urllib.error.HTTPError as error:
+            self.error_signal.emit(f"HTTP {error.code}: {error.reason}")
+            return
+        except urllib.error.URLError as error:
+            self.error_signal.emit(f"Network error: {error.reason}")
+            return
+        except Exception as error:
+            self.error_signal.emit(str(error))
+            return
+
+        release_info = {
+            "tag_name": str(data.get("tag_name", "")).strip(),
+            "name": str(data.get("name", "")).strip(),
+            "html_url": str(data.get("html_url", "")).strip(),
+            "body": str(data.get("body", "")),
+            "published_at": str(data.get("published_at", "")),
+            "draft": bool(data.get("draft", False)),
+            "prerelease": bool(data.get("prerelease", False)),
+        }
+        self.finished_signal.emit(release_info)
+
+
 class InputDropZone(QFrame):
     """Clickable drag-and-drop area for selecting .aep input files."""
     files_dropped = pyqtSignal(list)
@@ -747,6 +795,7 @@ class AEPDowngraderGUI(QMainWindow):
     MIN_AE_VERSION = 20
     MAX_AE_VERSION = 33
     EXPERIMENTAL_TARGET_VERSIONS = {20, 21}
+    UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
     
     def __init__(self):
         super().__init__()
@@ -757,6 +806,8 @@ class AEPDowngraderGUI(QMainWindow):
         self.detected_input_versions = {}
         self.current_output_directory = ""
         self.last_converted_files = []
+        self.update_check_worker = None
+        self._manual_update_check_active = False
         
         self.debug_enabled = False
         self.debug_log_path = None
@@ -770,6 +821,9 @@ class AEPDowngraderGUI(QMainWindow):
         if DEBUG_MODULE_AVAILABLE:
             debug_logger.info("Application started")
             debug_logger.log_memory("Application start")
+
+        # Run non-blocking update check shortly after startup.
+        QTimer.singleShot(1500, self.check_for_updates)
         
 
 
@@ -1036,6 +1090,11 @@ class AEPDowngraderGUI(QMainWindow):
         
         # Help menu
         help_menu = menubar.addMenu("Help")
+
+        check_updates_action = QAction("Check for Updates", self)
+        check_updates_action.triggered.connect(self.check_for_updates_manual)
+        help_menu.addAction(check_updates_action)
+        help_menu.addSeparator()
         
         about_action = QAction("About", self)
         about_action.triggered.connect(self.show_about)
@@ -1127,12 +1186,145 @@ class AEPDowngraderGUI(QMainWindow):
     def show_about(self):
         """Show about dialog"""
         about_text = "AEP Downgrader\n\n"
-        about_text += "Version 1.1.0\n\n"
+        about_text += f"Version {APP_VERSION}\n\n"
         about_text += "Convert Adobe After Effects project files\n"
         about_text += "from newer versions to older ones.\n\n"
         about_text += f"Debug Module: {'Available' if DEBUG_MODULE_AVAILABLE else 'Not Available'}\n"
         
         QMessageBox.about(self, "About AEP Downgrader", about_text)
+
+    def check_for_updates_manual(self):
+        """Manual update check from Help menu."""
+        self.check_for_updates(manual=True, force=True)
+
+    def check_for_updates(self, manual=False, force=False):
+        """Check GitHub releases for a newer app version."""
+        if self.update_check_worker and self.update_check_worker.isRunning():
+            if manual:
+                QMessageBox.information(self, "Update Check", "Update check is already in progress.")
+            return
+
+        if not force and not self._should_check_updates_now():
+            return
+
+        self._manual_update_check_active = manual
+        self.settings.setValue("updates/last_check_ts", int(time.time()))
+
+        self.update_check_worker = UpdateCheckWorker()
+        self.update_check_worker.finished_signal.connect(self._on_update_check_finished)
+        self.update_check_worker.error_signal.connect(self._on_update_check_error)
+        self.update_check_worker.start()
+
+    def _should_check_updates_now(self):
+        """Return True when periodic update check interval has elapsed."""
+        raw_value = self.settings.value("updates/last_check_ts", 0)
+        try:
+            last_check_ts = int(float(raw_value))
+        except (TypeError, ValueError):
+            last_check_ts = 0
+
+        now_ts = int(time.time())
+        return (now_ts - last_check_ts) >= self.UPDATE_CHECK_INTERVAL_SECONDS
+
+    def _normalize_version_tuple(self, version_string):
+        """Parse semantic-like version text into tuple for comparisons."""
+        if not version_string:
+            return tuple()
+        parts = re.findall(r"\d+", str(version_string))
+        return tuple(int(part) for part in parts)
+
+    def _is_newer_version(self, candidate_version, current_version):
+        """Compare two versions and return True if candidate > current."""
+        candidate = self._normalize_version_tuple(candidate_version)
+        current = self._normalize_version_tuple(current_version)
+        if not candidate or not current:
+            return False
+
+        max_len = max(len(candidate), len(current))
+        candidate += (0,) * (max_len - len(candidate))
+        current += (0,) * (max_len - len(current))
+        return candidate > current
+
+    def _on_update_check_finished(self, release_info):
+        manual = self._manual_update_check_active
+        self._manual_update_check_active = False
+
+        if self.update_check_worker:
+            self.update_check_worker.deleteLater()
+            self.update_check_worker = None
+
+        latest_tag = release_info.get("tag_name", "")
+        if not latest_tag:
+            if manual:
+                QMessageBox.warning(self, "Update Check", "Could not parse release version.")
+            return
+
+        if release_info.get("draft") or release_info.get("prerelease"):
+            if manual:
+                QMessageBox.information(self, "Update Check", "No stable update is currently available.")
+            return
+
+        if not self._is_newer_version(latest_tag, APP_VERSION):
+            if manual:
+                QMessageBox.information(
+                    self,
+                    "You're Up to Date",
+                    f"You are already on the latest version ({APP_VERSION})."
+                )
+            return
+
+        skipped_version = str(self.settings.value("updates/skipped_version", "") or "").strip()
+        if not manual and skipped_version == latest_tag:
+            return
+
+        self._show_update_available_dialog(release_info)
+
+    def _on_update_check_error(self, error_message):
+        manual = self._manual_update_check_active
+        self._manual_update_check_active = False
+
+        if self.update_check_worker:
+            self.update_check_worker.deleteLater()
+            self.update_check_worker = None
+
+        if manual:
+            QMessageBox.warning(self, "Update Check Failed", f"Could not check for updates:\n{error_message}")
+        elif DEBUG_MODULE_AVAILABLE and self.debug_enabled:
+            debug_logger.warning(f"Update check failed: {error_message}")
+
+    def _show_update_available_dialog(self, release_info):
+        """Show update available dialog with download and skip actions."""
+        latest_tag = release_info.get("tag_name", "")
+        release_name = release_info.get("name", "") or latest_tag
+        download_url = release_info.get("html_url", "").strip() or "https://github.com/itsAnchorpoint/AEP-Downgrader/releases/latest"
+        release_notes = str(release_info.get("body", "") or "").strip()
+
+        message_box = QMessageBox(self)
+        message_box.setIcon(QMessageBox.Information)
+        message_box.setWindowTitle("Update Available")
+        message_box.setText(f"A new version of AEP Downgrader is available: {release_name}")
+        message_box.setInformativeText(
+            f"Current version: {APP_VERSION}\nLatest version: {latest_tag}\n\nOpen download page?"
+        )
+        if release_notes:
+            message_box.setDetailedText(release_notes)
+
+        download_btn = message_box.addButton("Download", QMessageBox.AcceptRole)
+        skip_btn = message_box.addButton("Skip this Version", QMessageBox.DestructiveRole)
+        remind_btn = message_box.addButton("Remind Later", QMessageBox.RejectRole)
+        message_box.setDefaultButton(download_btn)
+        message_box.exec_()
+
+        clicked_button = message_box.clickedButton()
+        if clicked_button == download_btn:
+            self.settings.setValue("updates/skipped_version", "")
+            opened = QDesktopServices.openUrl(QUrl(download_url))
+            if not opened:
+                QMessageBox.warning(self, "Open URL Failed", f"Could not open:\n{download_url}")
+        elif clicked_button == skip_btn:
+            self.settings.setValue("updates/skipped_version", latest_tag)
+        elif clicked_button == remind_btn:
+            pass
     
     def apply_dark_theme(self):
         """Apply dark theme to the application"""
@@ -1839,7 +2031,7 @@ def main():
     
     # Set application properties
     app.setApplicationName("AEP Downgrader")
-    app.setApplicationVersion("1.1.0")
+    app.setApplicationVersion(APP_VERSION)
     
     # Create and show main window
     window = AEPDowngraderGUI()
