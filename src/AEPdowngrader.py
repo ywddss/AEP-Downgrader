@@ -69,12 +69,12 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QFileDialog, QTextEdit,
     QProgressBar, QGroupBox, QFormLayout, QMessageBox, QFrame,
-    QCheckBox, QSizePolicy, QAction, QMenuBar, QMenu,
+    QSizePolicy, QAction, QMenuBar, QMenu, QStyledItemDelegate, QStyle,
     QDialog, QDialogButtonBox, QScrollArea, QListWidget, QListWidgetItem,
     QStatusBar, QToolBar, QWidgetAction
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QSettings, QUrl
-from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QTextCursor, QDesktopServices
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QSettings, QUrl, QRect
+from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QTextCursor, QDesktopServices, QPainter
 
 
 class ModernDarkTheme:
@@ -674,8 +674,79 @@ class InputDropZone(QFrame):
         """)
 
 
+class TargetVersionDelegate(QStyledItemDelegate):
+    """Custom combobox item renderer with experimental badge."""
+
+    def paint(self, painter, option, index):
+        painter.save()
+
+        display_text = str(index.data(Qt.DisplayRole) or "")
+        is_experimental = bool(index.data(Qt.UserRole + 1))
+
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(option.rect, option.palette.highlight())
+            text_color = option.palette.highlightedText().color()
+        else:
+            text_color = option.palette.text().color()
+
+        content_rect = option.rect.adjusted(8, 0, -8, 0)
+        text_rect = QRect(content_rect)
+
+        badge_rect = None
+        badge_text = "EXPERIMENTAL"
+        if is_experimental:
+            badge_font = QFont(option.font)
+            badge_font.setBold(True)
+            badge_font.setPointSize(max(8, badge_font.pointSize() - 1))
+            painter.setFont(badge_font)
+            badge_metrics = painter.fontMetrics()
+
+            badge_height = max(16, min(20, content_rect.height() - 6))
+            badge_width = badge_metrics.horizontalAdvance(badge_text) + 14
+            badge_rect = QRect(
+                content_rect.right() - badge_width,
+                content_rect.center().y() - (badge_height // 2),
+                badge_width,
+                badge_height
+            )
+            text_rect = QRect(
+                content_rect.left(),
+                content_rect.top(),
+                max(10, content_rect.width() - badge_width - 8),
+                content_rect.height()
+            )
+
+        painter.setPen(text_color)
+        painter.setFont(option.font)
+        text_metrics = painter.fontMetrics()
+        elided_text = text_metrics.elidedText(display_text, Qt.ElideRight, text_rect.width())
+        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, elided_text)
+
+        if badge_rect:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#d9822b"))
+            painter.drawRoundedRect(badge_rect, 8, 8)
+
+            badge_font = QFont(option.font)
+            badge_font.setBold(True)
+            badge_font.setPointSize(max(8, badge_font.pointSize() - 1))
+            painter.setFont(badge_font)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
+
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        base_size = super().sizeHint(option, index)
+        return QSize(base_size.width(), max(base_size.height(), 28))
+
+
 class AEPDowngraderGUI(QMainWindow):
     """Main GUI window for AEP Downgrader"""
+    MIN_AE_VERSION = 20
+    MAX_AE_VERSION = 33
+    EXPERIMENTAL_TARGET_VERSIONS = {20, 21}
     
     def __init__(self):
         super().__init__()
@@ -683,6 +754,7 @@ class AEPDowngraderGUI(QMainWindow):
         # Initialize settings for remembering last used directories
         self.settings = QSettings("AEPDowngrader", "AEPDowngrader")
         self.selected_input_files = []
+        self.detected_input_versions = {}
         self.current_output_directory = ""
         self.last_converted_files = []
         
@@ -844,17 +916,18 @@ class AEPDowngraderGUI(QMainWindow):
         self.detected_version_label.setStyleSheet(f"color: {ModernDarkTheme.TEXT_SECONDARY}; font-style: italic;")
         options_layout.addWidget(self.detected_version_label)
 
-        # Target versions checkboxes
-        self.target_25_checkbox = QCheckBox("Convert to AE 25.x")
-        self.target_25_checkbox.setStyleSheet(self.get_checkbox_style())
-        self.target_24_checkbox = QCheckBox("Convert to AE 24.x")
-        self.target_24_checkbox.setStyleSheet(self.get_checkbox_style())
-        self.target_23_checkbox = QCheckBox("Convert to AE 23.x")
-        self.target_23_checkbox.setStyleSheet(self.get_checkbox_style())
+        target_label = QLabel("Target Version:")
+        target_label.setStyleSheet(f"color: {ModernDarkTheme.TEXT}; font-weight: bold;")
+        options_layout.addWidget(target_label)
 
-        options_layout.addWidget(self.target_25_checkbox)
-        options_layout.addWidget(self.target_24_checkbox)
-        options_layout.addWidget(self.target_23_checkbox)
+        self.target_version_combo = QComboBox()
+        self.target_version_combo.setStyleSheet(self.get_combobox_style())
+        self.target_version_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.target_version_combo.setMinimumHeight(37)
+        self.target_version_combo.setMaximumHeight(37)
+        self.target_version_combo.setItemDelegate(TargetVersionDelegate(self.target_version_combo))
+        options_layout.addWidget(self.target_version_combo)
+        self.update_target_version_options([])
         
         # Action buttons
         button_layout = QHBoxLayout()
@@ -1116,53 +1189,6 @@ class AEPDowngraderGUI(QMainWindow):
             }}
         """
 
-    def get_checkbox_style(self):
-        """Get stylesheet for checkboxes"""
-        return f"""
-            QCheckBox {{
-                spacing: 5px;
-                color: {ModernDarkTheme.TEXT};
-            }}
-            QCheckBox:disabled {{
-                color: #666666;
-            }}
-            QCheckBox::indicator {{
-                width: 18px;
-                height: 18px;
-            }}
-            QCheckBox::indicator:unchecked {{
-                border: 1px solid {ModernDarkTheme.BORDER};
-                background-color: {ModernDarkTheme.PANEL};
-            }}
-            QCheckBox::indicator:unchecked:disabled {{
-                border: 1px solid #444444;
-                background-color: #2a2a2a;
-            }}
-            QCheckBox::indicator:checked {{
-                border: 1px solid {ModernDarkTheme.HIGHLIGHT};
-                background-color: {ModernDarkTheme.HIGHLIGHT};
-            }}
-            QCheckBox::indicator:checked:disabled {{
-                border: 1px solid #444444;
-                background-color: #444444;
-            }}
-        """
-    
-    def get_line_edit_style(self):
-        """Get stylesheet for line edits"""
-        return f"""
-            QLineEdit {{
-                background-color: {ModernDarkTheme.PANEL};
-                border: 1px solid {ModernDarkTheme.BORDER};
-                border-radius: 4px;
-                padding: 8px;
-                color: {ModernDarkTheme.TEXT};
-            }}
-            QLineEdit:focus {{
-                border: 1px solid {ModernDarkTheme.HIGHLIGHT};
-            }}
-        """
-    
     def get_combobox_style(self):
         """Get stylesheet for combo boxes"""
         return f"""
@@ -1415,17 +1441,22 @@ class AEPDowngraderGUI(QMainWindow):
     def _update_detected_versions(self, file_paths):
         """Detect versions across all selected input files and update UI controls."""
         detected_versions = set()
-        highest_version = 0
+        detected_version_numbers = []
+        unknown_files = []
+        self.detected_input_versions = {}
 
         for file_path in file_paths:
             detected_version_str, detected_version_num = self.detect_ae_version(file_path)
+            self.detected_input_versions[file_path] = detected_version_num
             if detected_version_num > 0:
                 version_parts = detected_version_str.split()
                 if len(version_parts) >= 2:
                     detected_versions.add(f"{version_parts[0]} {version_parts[1]}")
                 elif len(version_parts) == 1:
                     detected_versions.add(version_parts[0])
-                highest_version = max(highest_version, detected_version_num)
+                detected_version_numbers.append(detected_version_num)
+            else:
+                unknown_files.append(Path(file_path).name)
 
         if detected_versions:
             def extract_version_number(version_str):
@@ -1435,11 +1466,38 @@ class AEPDowngraderGUI(QMainWindow):
                     return 0
 
             sorted_versions = sorted(detected_versions, reverse=True, key=extract_version_number)
-            self.detected_version_label.setText(f"Detected versions: {', '.join(sorted_versions)}")
+            unknown_suffix = f" (+{len(unknown_files)} unknown)" if unknown_files else ""
+            self.detected_version_label.setText(f"Detected versions: {', '.join(sorted_versions)}{unknown_suffix}")
         else:
             self.detected_version_label.setText("Detected versions: Unknown")
 
-        self.update_version_checkboxes(highest_version)
+        self.update_target_version_options(detected_version_numbers)
+
+    def update_target_version_options(self, detected_versions):
+        """Populate target version selector according to detected input versions."""
+        self.target_version_combo.clear()
+
+        if not detected_versions:
+            self.target_version_combo.addItem("No target versions available")
+            self.target_version_combo.setEnabled(False)
+            return
+
+        max_target_version = min(detected_versions) - 1
+        if max_target_version < self.MIN_AE_VERSION:
+            self.target_version_combo.addItem("No lower versions available")
+            self.target_version_combo.setEnabled(False)
+            return
+
+        for version in range(max_target_version, self.MIN_AE_VERSION - 1, -1):
+            label = f"AE {version}.x"
+            self.target_version_combo.addItem(label, version)
+            self.target_version_combo.setItemData(
+                self.target_version_combo.count() - 1,
+                version in self.EXPERIMENTAL_TARGET_VERSIONS,
+                Qt.UserRole + 1
+            )
+
+        self.target_version_combo.setEnabled(True)
 
     def _update_output_directory_from_inputs(self, file_paths):
         """Set and display output directory info based on selected input files."""
@@ -1483,28 +1541,6 @@ class AEPDowngraderGUI(QMainWindow):
         opened = QDesktopServices.openUrl(QUrl.fromLocalFile(target_dir))
         if not opened:
             QMessageBox.warning(self, "Open Folder Failed", f"Could not open folder:\n{target_dir}")
-
-    def update_version_checkboxes(self, detected_version):
-        """Update checkbox states based on detected version"""
-        # Disable checkboxes for versions equal or higher than detected version
-        # (can only downgrade to lower versions)
-        if detected_version > 25:
-            self.target_25_checkbox.setEnabled(True)
-        else:
-            self.target_25_checkbox.setEnabled(False)
-            self.target_25_checkbox.setChecked(False)
-
-        if detected_version > 24:
-            self.target_24_checkbox.setEnabled(True)
-        else:
-            self.target_24_checkbox.setEnabled(False)
-            self.target_24_checkbox.setChecked(False)
-
-        if detected_version > 23:
-            self.target_23_checkbox.setEnabled(True)
-        else:
-            self.target_23_checkbox.setEnabled(False)
-            self.target_23_checkbox.setChecked(False)
 
     def detect_ae_version(self, file_path):
         """Detect the AE version of an .aep file based on header analysis"""
@@ -1582,13 +1618,18 @@ class AEPDowngraderGUI(QMainWindow):
                 major_version_byte = head_data[1]
                 debug_info.append(f"major_version_byte (head_data[1]): {major_version_byte} (0x{major_version_byte:02x})")
                 
-                # Check if this looks like a valid AE version (>= AE 22)
-                if major_version_byte >= 0x5d and major_version_byte <= 0x6a:  # AE 22 to AE 33
+                min_version_byte = 0x5b + (self.MIN_AE_VERSION - 20)
+                max_version_byte = 0x5b + (self.MAX_AE_VERSION - 20)
+
+                # Check if this looks like a valid AE version in supported detection range.
+                if min_version_byte <= major_version_byte <= max_version_byte:
                     version = major_version_byte - 0x5b + 20
                     debug_info.append(f"Detected version: AE {version}.x")
                     result = f"AE {version}.x (detected)", version
                 else:
-                    debug_info.append(f"Version byte not in valid range (0x5d-0x6a)")
+                    debug_info.append(
+                        f"Version byte not in valid range (0x{min_version_byte:02x}-0x{max_version_byte:02x})"
+                    )
                     result = "Unknown version", 0
             
             debug_info.append(f"=== END DEBUG ===")
@@ -1622,19 +1663,42 @@ class AEPDowngraderGUI(QMainWindow):
             return
 
         input_files = list(self.selected_input_files)
-
-        # Get selected target versions
-        target_versions = []
-        if self.target_25_checkbox.isEnabled() and self.target_25_checkbox.isChecked():
-            target_versions.append("AE 25.x")
-        if self.target_24_checkbox.isEnabled() and self.target_24_checkbox.isChecked():
-            target_versions.append("AE 24.x")
-        if self.target_23_checkbox.isEnabled() and self.target_23_checkbox.isChecked():
-            target_versions.append("AE 23.x")
-
-        if not target_versions:
-            QMessageBox.warning(self, "Warning", "Please select at least one target version")
+        unknown_version_files = [
+            Path(path).name for path in input_files if self.detected_input_versions.get(path, 0) <= 0
+        ]
+        if unknown_version_files:
+            preview = ", ".join(unknown_version_files[:3])
+            suffix = "..." if len(unknown_version_files) > 3 else ""
+            QMessageBox.critical(
+                self,
+                "Unknown Source Version",
+                "Cannot convert because source version is unknown for:\n"
+                f"{preview}{suffix}\n\n"
+                "Please keep only files with detected versions."
+            )
             return
+
+        if not self.target_version_combo.isEnabled():
+            QMessageBox.warning(self, "Warning", "No compatible target versions are available.")
+            return
+
+        selected_target_version = self.target_version_combo.currentData()
+        if not isinstance(selected_target_version, int):
+            QMessageBox.warning(self, "Warning", "Please select a target version")
+            return
+
+        if selected_target_version in self.EXPERIMENTAL_TARGET_VERSIONS:
+            reply = QMessageBox.question(
+                self,
+                "Experimental Target Version",
+                f"AE {selected_target_version}.x is marked as experimental.\n"
+                "Compatibility is not guaranteed.\n\nContinue anyway?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        target_versions = [f"AE {selected_target_version}.x"]
 
         # Disable UI during conversion
         self.convert_btn.setEnabled(False)

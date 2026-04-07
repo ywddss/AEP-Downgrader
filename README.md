@@ -19,12 +19,15 @@ Features a modern dark-themed UI built with PyQt5.
 
 ## Supported Conversions
 
-| From | To |
-|------|-----|
-| AE 26.x | 25.x, 24.x, 23.x |
-| AE 25.x | 24.x, 23.x |
-| AE 24.x | 23.x |
-| AE 23.x | 22.x |
+- Source version detection range: **AE 20.x to AE 33.x**
+- Target selection in UI: **any lower version down to AE 20.x**
+- Stability labels in UI:
+  - **Stable**: AE 23.x, AE 24.x, AE 25.x
+  - **Experimental**: AE 21.x, AE 20.x
+
+Important:
+- The app only allows downgrading to versions lower than the detected source version.
+- Unknown source versions are blocked from conversion until removed from selection.
 
 ## Download
 
@@ -39,9 +42,9 @@ Pre-built binaries available on the [Releases page](https://github.com/itsAnchor
 1. Launch the application
 2. Select one or more .aep files
 3. The app automatically detects the source version
-4. Select target version(s) using checkboxes
+4. Select target version from the dropdown (stable/experimental labels are shown)
 5. Click "Convert"
-6. Converted files are saved in the same folder with version suffix (e.g., `project_AE24x.aep`)
+6. Converted files are saved next to each source file with version suffix (e.g., `project_AE24x.aep`)
 
 ## Debug Mode
 
@@ -94,7 +97,7 @@ python src/AEPdowngrader.py
 ### Creating a release
 
 ```bash
-# Update version in src/AEPdowngrader.py (lines 896, 1549)
+# Update version in src/AEPdowngrader.py (app metadata in `show_about()` and `main()`)
 # Update version in setup.py
 
 git commit -m "Release v1.2.0"

@@ -54,7 +54,10 @@ Based on analysis of files from various AE versions, we determined that key diff
 | AE 23.x | [0x5e, 0x09, 0x0b, 0x3b, 0x06, 0x37] | [94, 9, 11, 59, 6, 55] |
 | AE 22.x | [0x5d, 0x2b, 0x0b, 0x33, 0x06, 0x3b] | [93, 43, 11, 51, 6, 59] |
 
-Note that the first byte decreases with increasing version: 0x60 (25) → 0x5f (24) → 0x5e (23) → 0x5d (22).
+The current implementation uses a universal major-version byte formula:
+
+- `major_version = head_data[1] - 0x5b + 20`
+- Detected range in the app: **AE 20.x to AE 33.x**
 
 ## Conversion Process
 
@@ -63,16 +66,21 @@ Note that the first byte decreases with increasing version: 0x60 (25) → 0x5f (
 1. **File Reading**: Open the .aep file in binary mode
 2. **Header Analysis**: Extract data from the `head` chunk
 3. **Version Detection**: Compare with known signatures
-4. **Signature Conversion**: Replace bytes with those corresponding to the target version
+4. **Signature Conversion**: Update version-specific header bytes for the target version
 5. **Result Writing**: Save the modified file
+
+Current code-path detail:
+
+- The converter currently applies the transformation to **head_data[1]** (file offset `33`).
+- Additional signature bytes `[3,4,5,6,7]` are analyzed and modeled, but are not yet written in the active transform path.
 
 ### Byte Positioning
 
-For precise byte modification in the file, we use the following offsets:
+For precise byte modification in the current implementation:
 
 - Start of `head` chunk data: 32 bytes from the beginning of the file
-- Positions to modify: [1, 3, 4, 5, 6, 7] relative to the start of chunk data
-- Final file offsets: 32 + [1, 3, 4, 5, 6, 7] = [33, 35, 36, 37, 38, 39]
+- Active transformed position: `1` relative to chunk data
+- Active file offset: `32 + 1 = 33`
 
 ## Research History
 
@@ -92,9 +100,10 @@ After detailed analysis, we determined that 6 specific bytes in the `head` chunk
 
 We tested various transformation combinations and verified whether the results opened correctly in target AE versions.
 
-### Stage 5: Discovery of AE 22.x Issues
+### Stage 5: AE 22.x Compatibility Findings
 
-During testing of conversion to AE 22.x, structural differences were discovered that caused errors when opening files. Based on these observations, we decided to remove AE 22.x support due to potential compatibility issues.
+During earlier testing, conversion to lower legacy targets exposed structural compatibility issues in some projects.  
+The current UI marks **AE 21.x** and **AE 20.x** as **experimental** targets.
 
 ## Resources Used
 
@@ -102,13 +111,14 @@ This project is partially based on research conducted in the [aep-parser](https:
 
 ## Limitations
 
-1. **Supported Versions**: Currently only conversions to AE 24.x and AE 23.x are supported
+1. **Version Stability**: AE 23.x, 24.x, and 25.x are treated as stable targets in UI; AE 21.x and AE 20.x are experimental
 2. **Structural Differences**: Some complex projects may contain version-specific structural features
-3. **Plugins**: Effects and plugins unavailable in the target version may cause issues
+3. **Transform Scope**: Active transform path currently modifies the major-version byte (`head_data[1]`) only
+4. **Plugins**: Effects and plugins unavailable in the target version may cause issues
 
 ## Future Improvements
 
-1. **Extended Support**: Ability to handle additional structural differences between versions
+1. **Extended Transform Path**: Apply validated transformations to additional `head` bytes where required
 2. **Integrity Checks**: Addition of checks to ensure correctness of converted files
-3. **Additional Version Support**: Expansion of support after further research
-4. **Integrated Debug Mode**: Full debug functionality will be included in the application (currently requires separate `psutil` dependency)
+3. **Additional Version Validation**: Expand practical test matrix for experimental target versions
+4. **Debug Diagnostics Improvements**: Expand diagnostic output and add more actionable error hints
